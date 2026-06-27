@@ -4,211 +4,165 @@
 //
 //  WHAT THIS IS
 //  ------------
-//  Firmware that emulates a two-wire Hall/reed rotation sensor. The board sits
+//  Firmware that emulates a magnet-on-wheel rotation sensor. The board sits
 //  inline where the real sensor would be and makes the external controller
-//  ("the controller", i.e. the system under test) measure a commanded RPM.
-//  This is a bench-testing / spoofing tool.
+//  ("the controller", the system under test) measure a commanded wheel RPM.
+//  Bench-testing / spoofing tool.
 //
-//  ELECTRICAL MODEL  (why we toggle pinMode instead of writing HIGH/LOW)
-//  --------------------------------------------------------------------
-//  The real sensor is a DRY CONTACT / OPEN-COLLECTOR switch, not a voltage
-//  source. Verified by direct measurement (A0 + internal pull-up):
-//      * No magnet -> circuit OPEN (high-Z). Controller's pull-up holds line
-//        HIGH. This is the idle / resting state (line sits here most of time).
-//      * Magnet present -> circuit CONDUCTS, shorting line to GND -> LOW.
-//        One brief LOW pulse per magnet pass per revolution.
-//  So normal operation = line HIGH at rest with short LOW pulses. The
-//  controller counts those LOW edges and converts edge frequency to RPM.
+//  PHYSICAL MODEL  (why pulse width changes with RPM)
+//  --------------------------------------------------
+//  A magnet rides on the wheel at some radius from the axle. Once per
+//  revolution (per magnet) it sweeps past the fixed sensor. The sensor outputs
+//  a pulse for as long as the magnet is inside its detection zone. So:
 //
-//  We reproduce the switch with ONE pin, no transistor/opto/relay, by changing
-//  pin MODE (not output voltage):
-//      OPEN  (idle, "no magnet")  -> pinMode(INPUT)  : high-Z, NO pull-up.
-//                                    Controller's pull-up sets the HIGH level.
-//      CONDUCT (pulse, "magnet")  -> pinMode(OUTPUT) : drives LOW (port bit 0).
-//  We NEVER digitalWrite(HIGH): driving HIGH would fight the controller's
-//  pull-up and is electrically wrong. The PORT bit is forced to 0 once in
-//  setup(), so flipping DDR alone gives: INPUT=high-Z idle, OUTPUT=LOW pulse.
+//    * PULSE PERIOD  = time between magnet passes = 60 / (RPM * magnets/rev).
+//      Faster wheel -> pulses come closer together.
+//    * PULSE WIDTH   = how long the magnet stays in the detection zone =
+//      (detection-zone length) / (magnet's tangential speed). The magnet's
+//      tangential speed is 2*pi*r*RPM/60, so faster wheel / bigger radius ->
+//      magnet zips past faster -> SHORTER pulse.
+//
+//  INPUTS (edit below, re-flash):
+//    TARGET_KMH         - GROUND SPEED to emulate (km/h). The thing you set.
+//    WHEEL_DIAMETER_MM  - wheel outer diameter; converts km/h -> wheel RPM
+//                         (RPM = v / (pi*D) * 60).
+//    MAGNET_RADIUS_MM   - axle-center to magnet distance (sets tangential speed)
+//    MAGNET_DETECT_MM   - length of the sensor's detection zone along the
+//                         magnet's path. THIS sets pulse width. Unknown up
+//                         front: calibrate it (see CALIBRATION below).
+//    PULSES_PER_REV     - number of magnets on the wheel (usually 1).
+//
+//  NOTE: the controller counts EDGES, so the displayed speed is set by the
+//  pulse RATE (period), which TARGET_KMH + WHEEL_DIAMETER_MM determine. Pulse
+//  width (MAGNET_RADIUS_MM / MAGNET_DETECT_MM) only shapes the pulse; it does
+//  not change the reading. If the controller's displayed speed is off by a
+//  constant factor, trim WHEEL_DIAMETER_MM (or PULSES_PER_REV) to match.
+//
+//  CALIBRATION of MAGNET_DETECT_MM
+//  -------------------------------
+//  Capture the REAL sensor at a known RPM (your scope/ tool). Measure its pulse
+//  width Tp (seconds) and the period. Then:
+//      detect_mm = Tp * (2*pi*MAGNET_RADIUS_MM*RPM/60)
+//  Plug that in and the emulator reproduces the real pulse width at any RPM.
+//
+//  ELECTRICAL MODEL
+//  ----------------
+//  The real sensor is a dry contact / open-collector switch: idle = line HIGH
+//  (controller's pull-up), magnet present = line shorted toward GND. We emulate
+//  with ONE pin. Two drive modes (see PUSH_PULL):
+//    PUSH_PULL 1 - actively drive HIGH at rest, LOW at pulse. Guaranteed clean
+//                  edges even if the controller has no pull-up.
+//    PUSH_PULL 0 - open-collector: high-Z at rest (controller pull-up sets
+//                  HIGH), drive LOW at pulse. Faithful to the dry contact.
 //
 //  WIRING
 //  ------
-//      SIGNAL_PIN (D9) ........ controller's POSITIVE sensor line
-//      Pro Micro GND .......... controller 0V line  (shared ground, required)
-//      battery negative ....... that same shared ground node
-//  Power the Pro Micro from a floating battery pack; tie only the negatives
-//  together at a single point. The pin pulls the positive line toward the
-//  shared ground during a pulse.
-//
-//  HOW TO CHANGE RPM
-//  -----------------
-//  Edit TARGET_RPM (and PULSES_PER_REV if needed) below and re-flash. There is
-//  no runtime control interface; the board emits the configured RPM at boot.
-//
-//  UNVERIFIED PRECONDITIONS - the human MUST confirm before wiring hardware
-//  -----------------------------------------------------------------------
-//   1. BOARD VARIANT vs LINE VOLTAGE. This sketch assumes a 5V/16MHz Pro Micro
-//      whose GPIO tolerate the measured below-5V open-circuit line. On a
-//      3.3V/8MHz Pro Micro the GPIO are NOT 5V-tolerant (abs max ~3.6V):
-//      re-measure the open-circuit voltage, confirm it is <=3.3V, and if it
-//      sits between 3.3V and 5V do NOT go pin-direct (use a series resistor +
-//      clamp, level shifter, or opto-MOSFET). Confirm which board you have.
-//      (On 8MHz the timer math below still works: ticks/us is derived from
-//       F_CPU, so timing stays correct - but the voltage issue remains.)
-//   2. SHORT-CIRCUIT CURRENT <= ~20 mA (ATmega32U4 per-pin recommendation;
-//      abs max 40 mA). The pin sinks this whenever it holds the line LOW. The
-//      ~1.5V-under-load reading suggests only a few mA; verify with a meter.
-//   3. POLARITY: pin pulls the positive line toward shared ground; Pro Micro
-//      GND ties to the controller's 0V.
-//   4. SHARED GROUND: Pro Micro GND connected to controller 0V; battery
-//      negative to that same node.
-//
-//  USB GROUND CAVEAT
-//  -----------------
-//  You still plug into a computer over USB to FLASH. Doing that while the board
-//  is wired to the controller joins the computer's ground to the shared-ground
-//  node and can create a ground loop / conflict. Workflow: flash first
-//  (disconnected from controller), THEN wire to controller and run on battery.
-//  This sketch never waits for Serial (would hang forever with no USB host).
-//
-//  QUICK VALIDATION
-//  ----------------
-//   * Scope SIGNAL_PIN with the controller (or a temp pull-up to VCC) attached:
-//     rests HIGH, dips to 0V during brief LOW pulses. A bare high-Z pin with no
-//     pull-up floats and won't read a clean HIGH - that is expected.
-//   * With N=1, LOW-pulse frequency must equal TARGET_RPM/60 Hz.
+//      SIGNAL_PIN (A2) ........ controller's signal sensor line
+//      Pro Micro GND .......... controller GND line  (shared ground, required)
+//  Flash over USB DISCONNECTED from the controller, then wire and run.
 // =============================================================================
 
 // ----------------------------- CONFIGURATION ---------------------------------
-// D9 = PB5 = OC1A, the Timer1 output-compare pin. That is fine here: we leave
-// TCCR1A = 0 so the COM1A output is DISCONNECTED and D9 stays plain GPIO that we
-// drive via pinMode. Timer1 is used only as an interrupt source, not as a PWM
-// output, so the pin and the generation timer do not actually collide.
-#define SIGNAL_PIN        9        // digital pin emulating the sensor switch (D9)
-#define TARGET_RPM        30       // RPM to emit; edit and re-flash to change
-#define PULSES_PER_REV    1        // N: LOW pulses per revolution
-#define PULSE_WIDTH_US    250000  // nominal LOW-pulse width (microseconds)
-#define PULSE_DUTY_CAP    0.50     // pulse width never exceeds this fraction of period
-#define MAX_RPM           1000    // sanity clamp
+#define SIGNAL_PIN         A2      // pin emulating the sensor switch (wired to
+                                   // controller's signal pin; GND is shared)
+
+// --- desired output ---
+#define TARGET_KMH         20.0    // GROUND SPEED to emulate (km/h) <-- set this
+
+// --- wheel / magnet geometry ---
+#define WHEEL_DIAMETER_MM  675.0   // wheel outer diameter (mm); converts km/h->RPM
+#define MAGNET_RADIUS_MM   50.0    // axle center -> magnet distance (mm)
+#define MAGNET_DETECT_MM   20.0    // sensor detection-zone length (mm); CALIBRATE
+#define PULSES_PER_REV     1       // magnets on the wheel
+
+// --- limits / drive ---
+#define MAX_RPM            1000.0  // sanity clamp
+#define MIN_PULSE_US       50UL    // floor so very fast spins still give a pulse
+#define MAX_DUTY           0.90    // pulse never exceeds this fraction of period
+#define PUSH_PULL          0       // 1=drive both rails, 0=open-collector
 // -----------------------------------------------------------------------------
 
-// Timer1 runs in CTC mode with a /8 prescaler. ticksPerUs is derived from F_CPU
-// so the math is correct on both 16MHz (=2) and 8MHz (=1) boards.
-static const uint32_t TICKS_PER_US = (F_CPU / 8UL) / 1000000UL;
+// Pre-computed phase durations in microseconds (filled in setup()).
+static uint32_t g_pulseUs = 0;
+static uint32_t g_restUs  = 0;
+static bool     g_run     = false;
 
-// State machine phases.
-enum { STATE_REST, STATE_PULSE };
+#if PUSH_PULL
+static inline void lineConduct() { digitalWrite(SIGNAL_PIN, LOW);  } // pulse: 0V
+static inline void lineOpen()    { digitalWrite(SIGNAL_PIN, HIGH); } // rest:  HIGH
+#else
+static inline void lineConduct() { pinMode(SIGNAL_PIN, OUTPUT); }    // drive LOW
+static inline void lineOpen()    { pinMode(SIGNAL_PIN, INPUT);  }    // high-Z idle
+#endif
 
-// Pre-computed phase durations in Timer1 ticks (written once in setup() before
-// interrupts are enabled, then only read by the ISR).
-static uint32_t g_pulseTicks = 0;
-static uint32_t g_restTicks  = 0;
+// DEBUG pulse indicator on the Pro Micro RX LED (pin 17, active-LOW). There is
+// NO D13 LED on a Pro Micro, so LED_BUILTIN is useless here.
+#define LED_PIN 17
+static inline void ledOn()  { digitalWrite(LED_PIN, LOW);  }
+static inline void ledOff() { digitalWrite(LED_PIN, HIGH); }
 
-// ISR working state.
-volatile uint8_t  g_state    = STATE_REST;
-volatile uint32_t g_remTicks = 0;   // ticks left before the current phase ends
-
-// Timer1 16-bit counter -> one compare interval is OCR1A+1 ticks. A phase may
-// be longer than the 16-bit range (e.g. very low RPM), so we burn it down in
-// chunks of up to 65536 ticks; only the final chunk ends the phase.
-//
-// CRITICAL: OCR1A is re-armed *inside* the ISR, after the compare match already
-// reset TCNT1 to 0 and the ISR prologue/pinMode advanced it a few ticks. In CTC
-// mode TOP=OCR1A, so if we ever load an OCR1A below the current TCNT1, the
-// counter misses the match, runs to 0xFFFF, wraps, and only then matches ->
-// ~65536 stray ticks (~33 ms) bolted onto that phase. If a phase consistently
-// ended in a tiny tail, that error would repeat every cycle (~2x RPM error).
-// Two guards prevent any sub-latency interval from ever being scheduled:
-//   * CHUNK_FLOOR: a final chunk is never shorter than this (>> ISR latency).
-//   * Split rule: when the remainder is in (65536, 131072], halve it instead of
-//     emitting a full 65536 + a tiny tail. Each half is then >= 32768 ticks, so
-//     the final <=65536 chunk that ends the phase is always comfortably large
-//     (unless the whole phase was pathologically short, which CHUNK_FLOOR caps).
-static const uint32_t CHUNK_FLOOR = 100;   // ticks; safely above ISR latency
-
-static inline void armNextChunk() {
-  if (g_remTicks > 65536UL) {
-    uint32_t chunk = (g_remTicks <= 2UL * 65536UL) ? (g_remTicks / 2)  // avoid tiny tail
-                                                   : 65536UL;
-    OCR1A = (uint16_t)(chunk - 1);
-    g_remTicks -= chunk;
-  } else {
-    uint32_t chunk = g_remTicks ? g_remTicks : 1;  // never schedule a zero interval
-    if (chunk < CHUNK_FLOOR) chunk = CHUNK_FLOOR;  // floor the final interval
-    OCR1A = (uint16_t)(chunk - 1);                 // final chunk ends the phase
-    g_remTicks = 0;
-  }
-}
-
-// Minimal ISR: either continue burning down the current phase, or flip the pin
-// mode to start the next phase and reschedule. No serial / no blocking work.
-ISR(TIMER1_COMPA_vect) {
-  if (g_remTicks > 0) {          // more chunks left in this phase
-    armNextChunk();
-    return;
-  }
-  if (g_state == STATE_PULSE) {
-    pinMode(SIGNAL_PIN, INPUT);  // OPEN / high-Z idle -> controller pull-up = HIGH
-    g_state    = STATE_REST;
-    g_remTicks = g_restTicks;
-  } else {
-    pinMode(SIGNAL_PIN, OUTPUT); // CONDUCT -> LOW (port bit already 0)
-    g_state    = STATE_PULSE;
-    g_remTicks = g_pulseTicks;
-  }
-  armNextChunk();
+// delayMicroseconds() is only reliable below ~16 ms. Split long waits into a
+// millisecond delay() plus a microsecond remainder so any phase length works.
+static inline void waitUs(uint32_t us) {
+  if (us >= 1000UL) { delay(us / 1000UL); us %= 1000UL; }
+  if (us) delayMicroseconds((unsigned int)us);
 }
 
 void setup() {
-  // Force the output latch LOW once and rest in high-Z INPUT (the Pro Micro's
-  // default at power-up). INPUT+PORT=0 -> high-Z, no pull-up -> idle HIGH via
-  // controller. OUTPUT+PORT=0 -> driven LOW. So we only ever flip DDR; the line
-  // is never driven HIGH and there is no spurious pulse at boot.
   digitalWrite(SIGNAL_PIN, LOW);
-  pinMode(SIGNAL_PIN, INPUT);
+#if PUSH_PULL
+  pinMode(SIGNAL_PIN, OUTPUT);   // stays OUTPUT; we toggle the level
+#endif
+  lineOpen();                    // start at rest (HIGH / high-Z)
 
-  // ---- compute phase durations from the constants (once at startup) ----
-  long rpm = TARGET_RPM;
-  if (rpm <= 0) {
-    // RPM = 0 / stop: hold open (high-Z, HIGH) continuously, emit no pulses.
-    // This is the "healthy sensor, wheel stopped" signal. Timer never starts.
-    // A negative TARGET_RPM also lands here: stop is the only sane reading of
-    // "negative speed", so we treat it as stop rather than clamping to MAX_RPM.
+  pinMode(LED_PIN, OUTPUT);
+  ledOff();
+
+  const float PI_F = 3.14159265f;
+
+  // --- km/h -> wheel RPM ---
+  // ground speed v (mm/s) = circumference * rev/s ; circumference = pi*D.
+  // 1 km/h = 1e6 mm / 3600 s = 277.778 mm/s.
+  if (TARGET_KMH <= 0.0f) {        // stop: hold idle, emit nothing
+    g_run = false;
     return;
   }
-  if (rpm > MAX_RPM) rpm = MAX_RPM;          // clamp out-of-range RPM
+  float v_ground_mm_s = (float)TARGET_KMH * (1000000.0f / 3600.0f);
+  float circ_mm       = PI_F * WHEEL_DIAMETER_MM;
+  float rpm           = v_ground_mm_s * 60.0f / circ_mm;
+  if (rpm > MAX_RPM) rpm = MAX_RPM;
 
-  float freq_hz = (float)rpm * (float)PULSES_PER_REV / 60.0f;   // LOW pulses/sec
-  uint32_t period_us = (uint32_t)(1000000.0f / freq_hz + 0.5f); // rest+pulse cycle
-  if (period_us == 0) period_us = 1;
+  // --- pulse period: time between magnet passes ---
+  float pulses_per_sec = rpm * (float)PULSES_PER_REV / 60.0f;
+  float period_us_f    = 1000000.0f / pulses_per_sec;
 
-  // Fixed pulse width, but never let it approach the period (clamp to a
-  // fraction of it) so high RPM still leaves a clean rest gap.
-  uint32_t pulse_us = (uint32_t)PULSE_WIDTH_US;
-  uint32_t cap_us   = (uint32_t)((float)period_us * PULSE_DUTY_CAP);
-  if (pulse_us > cap_us) pulse_us = cap_us;
-  if (pulse_us == 0)     pulse_us = 1;
-  uint32_t rest_us = period_us - pulse_us;
+  // --- pulse width: detection-zone length / magnet tangential speed ---
+  // tangential speed (mm/s) = 2*pi*r*RPM/60
+  float v_mag_mm_s = 2.0f * PI_F * MAGNET_RADIUS_MM * rpm / 60.0f;
+  float pulse_us_f = (v_mag_mm_s > 0.0f)
+                       ? (MAGNET_DETECT_MM / v_mag_mm_s) * 1000000.0f
+                       : period_us_f;
 
-  g_pulseTicks = pulse_us * TICKS_PER_US;
-  g_restTicks  = rest_us  * TICKS_PER_US;
-  if (g_pulseTicks == 0) g_pulseTicks = 1;
-  if (g_restTicks  == 0) g_restTicks  = 1;
+  // clamp: keep a rest gap, and never below the hardware pulse floor
+  float cap = period_us_f * MAX_DUTY;
+  if (pulse_us_f > cap) pulse_us_f = cap;
 
-  // ---- Timer1: CTC (WGM12), /8 prescaler (CS11), compare-A interrupt ----
-  noInterrupts();
-  TCCR1A = 0;                       // normal port operation, CTC via TCCR1B
-  TCCR1B = (1 << WGM12) | (1 << CS11);
-  TCNT1  = 0;
-  TIMSK1 = (1 << OCIE1A);           // enable Timer1 compare-A interrupt
+  uint32_t period_us = (uint32_t)(period_us_f + 0.5f);
+  uint32_t pulse_us  = (uint32_t)(pulse_us_f + 0.5f);
+  if (pulse_us < MIN_PULSE_US) pulse_us = MIN_PULSE_US;
+  if (pulse_us >= period_us)   pulse_us = period_us / 2;
+  if (pulse_us == 0)           pulse_us = 1;
 
-  // Start in REST so the line idles HIGH first (no pulse at boot); the first
-  // ISR after the rest interval begins the first LOW pulse.
-  g_state    = STATE_REST;
-  g_remTicks = g_restTicks;
-  armNextChunk();
-  interrupts();
+  g_pulseUs = pulse_us;
+  g_restUs  = period_us - pulse_us;
+  g_run     = true;
 }
 
 void loop() {
-  // Nothing to do: all pulse generation is interrupt-driven for timing
-  // accuracy. The MCU may idle here. No Serial -> safe to run standalone.
+  if (!g_run) return;          // stopped: line idles, no pulses
+
+  lineConduct();  ledOn();     // magnet in detection zone -> pulse
+  waitUs(g_pulseUs);
+  lineOpen();     ledOff();    // magnet gone -> rest at idle
+  waitUs(g_restUs);
 }
