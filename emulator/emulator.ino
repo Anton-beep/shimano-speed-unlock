@@ -67,7 +67,7 @@
                                    // controller's signal pin; GND is shared)
 
 // --- desired output ---
-#define TARGET_KMH         20.0    // GROUND SPEED to emulate (km/h) <-- set this
+#define TARGET_KMH         10.0    // GROUND SPEED to emulate (km/h) <-- set this
 
 // --- wheel / magnet geometry ---
 #define WHEEL_DIAMETER_MM  675.0   // wheel outer diameter (mm); converts km/h->RPM
